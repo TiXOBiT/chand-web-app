@@ -5,24 +5,21 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 type Period = "1D" | "1W" | "1M" | "1Y";
-type CanonicalCurrency = "usd" | "eur" | "gold" | "coin";
+type Currency = "usd" | "eur" | "gold" | "coin";
 
-const PERIODS: Record<Period, { windowInterval: string; mode: "raw" | "hour" | "sixHour" | "day" }> = {
-  "1D": { windowInterval: "24 hours", mode: "raw" },
-  "1W": { windowInterval: "7 days", mode: "hour" },
-  "1M": { windowInterval: "30 days", mode: "sixHour" },
-  "1Y": { windowInterval: "365 days", mode: "day" },
+const PERIODS: Record<Period, { ms: number; mode: "raw" | "hour" | "sixHour" | "day" }> = {
+  "1D": { ms: 24 * 60 * 60 * 1000, mode: "raw" },
+  "1W": { ms: 7 * 24 * 60 * 60 * 1000, mode: "hour" },
+  "1M": { ms: 30 * 24 * 60 * 60 * 1000, mode: "sixHour" },
+  "1Y": { ms: 365 * 24 * 60 * 60 * 1000, mode: "day" },
 };
 
-function normalizeCurrency(input: string | null): CanonicalCurrency | null {
+function normalizeCurrency(input: string | null): Currency | null {
   if (!input) return null;
   const v = input.trim().toLowerCase();
-
-  // aliases
   if (v === "dollar") return "usd";
   if (v === "euro") return "eur";
-  if (v === "coin" || v === "emami") return "coin";
-
+  if (v === "emami") return "coin";
   if (v === "usd" || v === "eur" || v === "gold" || v === "coin") return v;
   return null;
 }
@@ -32,10 +29,9 @@ function normalizePeriod(input: string | null): Period {
   return (v === "1D" || v === "1W" || v === "1M" || v === "1Y") ? (v as Period) : "1D";
 }
 
-function toISO(ts: unknown): string {
-  if (ts instanceof Date) return ts.toISOString();
-  if (typeof ts === "string" || typeof ts === "number") return new Date(ts).toISOString();
-  return new Date(String(ts)).toISOString();
+function toISO(d: unknown): string {
+  if (d instanceof Date) return d.toISOString();
+  return new Date(String(d)).toISOString();
 }
 
 export async function GET(req: Request) {
@@ -46,11 +42,15 @@ export async function GET(req: Request) {
 
     if (!currency) {
       return NextResponse.json(
-        { ok: false, error: "Invalid currency. Use: usd|eur|gold|coin (or aliases: dollar|euro|emami)" },
+        { ok: false, error: "Invalid currency. Use usd|eur|gold|coin (or aliases: dollar|euro|emami)" },
         { status: 400 }
       );
     }
 
+    const { ms, mode } = PERIODS[period];
+    const start = new Date(Date.now() - ms);
+
+    // latest price
     const current = await sql<{ price: number; created_at: Date }>`
       SELECT price, created_at
       FROM prices
@@ -62,64 +62,47 @@ export async function GET(req: Request) {
     const current_price = current.rows[0]?.price ?? null;
     const current_timestamp = current.rows[0]?.created_at ? toISO(current.rows[0].created_at) : null;
 
-    const { windowInterval, mode } = PERIODS[period];
-
-    let series:
-      | Array<{ bucket: Date; price: number }>
-      | Array<{ created_at: Date; price: number }>;
+    let rows: Array<{ t: Date; price: number }> = [];
 
     if (mode === "raw") {
       const res = await sql<{ created_at: Date; price: number }>`
         SELECT created_at, price
         FROM prices
-        WHERE currency = ${currency}
-          AND created_at >= NOW() - INTERVAL ${windowInterval}
+        WHERE currency = ${currency} AND created_at >= ${start}
         ORDER BY created_at ASC;
       `;
-      series = res.rows;
+      rows = res.rows.map(r => ({ t: r.created_at, price: r.price }));
     } else if (mode === "hour") {
       const res = await sql<{ bucket: Date; price: number }>`
-        SELECT
-          date_trunc('hour', created_at) AS bucket,
-          ROUND(AVG(price))::int AS price
+        SELECT date_trunc('hour', created_at) AS bucket,
+               ROUND(AVG(price))::int AS price
         FROM prices
-        WHERE currency = ${currency}
-          AND created_at >= NOW() - INTERVAL ${windowInterval}
+        WHERE currency = ${currency} AND created_at >= ${start}
         GROUP BY bucket
         ORDER BY bucket ASC;
       `;
-      series = res.rows;
+      rows = res.rows.map(r => ({ t: r.bucket, price: r.price }));
     } else if (mode === "sixHour") {
-      // date_bin is supported in modern Postgres (and is great for fixed buckets)
       const res = await sql<{ bucket: Date; price: number }>`
-        SELECT
-          date_bin(INTERVAL '6 hours', created_at, TIMESTAMPTZ '1970-01-01') AS bucket,
-          ROUND(AVG(price))::int AS price
+        SELECT date_bin(INTERVAL '6 hours', created_at, TIMESTAMPTZ '1970-01-01') AS bucket,
+               ROUND(AVG(price))::int AS price
         FROM prices
-        WHERE currency = ${currency}
-          AND created_at >= NOW() - INTERVAL ${windowInterval}
+        WHERE currency = ${currency} AND created_at >= ${start}
         GROUP BY bucket
         ORDER BY bucket ASC;
       `;
-      series = res.rows;
+      rows = res.rows.map(r => ({ t: r.bucket, price: r.price }));
     } else {
       const res = await sql<{ bucket: Date; price: number }>`
-        SELECT
-          date_trunc('day', created_at) AS bucket,
-          ROUND(AVG(price))::int AS price
+        SELECT date_trunc('day', created_at) AS bucket,
+               ROUND(AVG(price))::int AS price
         FROM prices
-        WHERE currency = ${currency}
-          AND created_at >= NOW() - INTERVAL ${windowInterval}
+        WHERE currency = ${currency} AND created_at >= ${start}
         GROUP BY bucket
         ORDER BY bucket ASC;
       `;
-      series = res.rows;
+      rows = res.rows.map(r => ({ t: r.bucket, price: r.price }));
     }
-
-    const chart_data = series.map((r: any) => ({
-      timestamp: toISO(r.bucket ?? r.created_at),
-      price: Number(r.price),
-    }));
 
     return NextResponse.json(
       {
@@ -128,22 +111,16 @@ export async function GET(req: Request) {
         period,
         current_price,
         current_timestamp,
-        chart_data,
+        chart_data: rows.map(r => ({ timestamp: r.t.toISOString(), price: r.price })),
       },
       {
         status: 200,
-        headers: {
-          // Helps mobile apps; tweak if you want “more live”
-          "Cache-Control": "public, s-maxage=30, stale-while-revalidate=60",
-        },
+        headers: { "Cache-Control": "public, s-maxage=30, stale-while-revalidate=60" },
       }
     );
   } catch (err) {
     return NextResponse.json(
-      {
-        ok: false,
-        error: err instanceof Error ? err.message : "Unknown error",
-      },
+      { ok: false, error: err instanceof Error ? err.message : "Unknown error" },
       { status: 500 }
     );
   }
