@@ -2,6 +2,10 @@
 import { AreaChart, Area, Tooltip, ResponsiveContainer } from 'recharts';
 
 export default function ChartComponent({ data }: { data: any[] }) {
+  // این تکه کد را اضافه کنید:
+  if (!data || data.length === 0) {
+    return <div className="h-[300px] flex items-center justify-center text-gray-500">No Data Available</div>;
+  }
   const startPrice = data?.[0]?.price || 0;
   const endPrice = data?.[data.length - 1]?.price || 0;
   const isProfit = endPrice >= startPrice;
