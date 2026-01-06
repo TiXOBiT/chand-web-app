@@ -29,11 +29,6 @@ function normalizePeriod(input: string | null): Period {
   return (v === "1D" || v === "1W" || v === "1M" || v === "1Y") ? (v as Period) : "1D";
 }
 
-function toISO(d: unknown): string {
-  if (d instanceof Date) return d.toISOString();
-  return new Date(String(d)).toISOString();
-}
-
 export async function GET(req: Request) {
   try {
     const { searchParams } = new URL(req.url);
@@ -48,11 +43,10 @@ export async function GET(req: Request) {
     }
 
     const { ms, mode } = PERIODS[period];
-    const start = new Date(Date.now() - ms);
+    const startIso = new Date(Date.now() - ms).toISOString();
 
-    // latest price
-    const current = await sql<{ price: number; created_at: Date }>`
-      SELECT price, created_at
+    const current = await sql<{ price: number; created_at: string }>`
+      SELECT price, created_at::text AS created_at
       FROM prices
       WHERE currency = ${currency}
       ORDER BY created_at DESC
@@ -60,48 +54,53 @@ export async function GET(req: Request) {
     `;
 
     const current_price = current.rows[0]?.price ?? null;
-    const current_timestamp = current.rows[0]?.created_at ? toISO(current.rows[0].created_at) : null;
+    const current_timestamp = current.rows[0]?.created_at ?? null;
 
-    let rows: Array<{ t: Date; price: number }> = [];
+    type Row = { t: string; price: number };
+    let rows: Row[] = [];
 
     if (mode === "raw") {
-      const res = await sql<{ created_at: Date; price: number }>`
-        SELECT created_at, price
+      const res = await sql<{ created_at: string; price: number }>`
+        SELECT created_at::text AS created_at, price
         FROM prices
-        WHERE currency = ${currency} AND created_at >= ${start}
+        WHERE currency = ${currency}
+          AND created_at >= ${startIso}::timestamptz
         ORDER BY created_at ASC;
       `;
-      rows = res.rows.map(r => ({ t: r.created_at, price: r.price }));
+      rows = res.rows.map((r) => ({ t: r.created_at, price: r.price }));
     } else if (mode === "hour") {
-      const res = await sql<{ bucket: Date; price: number }>`
-        SELECT date_trunc('hour', created_at) AS bucket,
+      const res = await sql<{ bucket: string; price: number }>`
+        SELECT date_trunc('hour', created_at)::text AS bucket,
                ROUND(AVG(price))::int AS price
         FROM prices
-        WHERE currency = ${currency} AND created_at >= ${start}
+        WHERE currency = ${currency}
+          AND created_at >= ${startIso}::timestamptz
         GROUP BY bucket
         ORDER BY bucket ASC;
       `;
-      rows = res.rows.map(r => ({ t: r.bucket, price: r.price }));
+      rows = res.rows.map((r) => ({ t: r.bucket, price: r.price }));
     } else if (mode === "sixHour") {
-      const res = await sql<{ bucket: Date; price: number }>`
-        SELECT date_bin(INTERVAL '6 hours', created_at, TIMESTAMPTZ '1970-01-01') AS bucket,
+      const res = await sql<{ bucket: string; price: number }>`
+        SELECT date_bin(INTERVAL '6 hours', created_at, TIMESTAMPTZ '1970-01-01')::text AS bucket,
                ROUND(AVG(price))::int AS price
         FROM prices
-        WHERE currency = ${currency} AND created_at >= ${start}
+        WHERE currency = ${currency}
+          AND created_at >= ${startIso}::timestamptz
         GROUP BY bucket
         ORDER BY bucket ASC;
       `;
-      rows = res.rows.map(r => ({ t: r.bucket, price: r.price }));
+      rows = res.rows.map((r) => ({ t: r.bucket, price: r.price }));
     } else {
-      const res = await sql<{ bucket: Date; price: number }>`
-        SELECT date_trunc('day', created_at) AS bucket,
+      const res = await sql<{ bucket: string; price: number }>`
+        SELECT date_trunc('day', created_at)::text AS bucket,
                ROUND(AVG(price))::int AS price
         FROM prices
-        WHERE currency = ${currency} AND created_at >= ${start}
+        WHERE currency = ${currency}
+          AND created_at >= ${startIso}::timestamptz
         GROUP BY bucket
         ORDER BY bucket ASC;
       `;
-      rows = res.rows.map(r => ({ t: r.bucket, price: r.price }));
+      rows = res.rows.map((r) => ({ t: r.bucket, price: r.price }));
     }
 
     return NextResponse.json(
@@ -111,7 +110,7 @@ export async function GET(req: Request) {
         period,
         current_price,
         current_timestamp,
-        chart_data: rows.map(r => ({ timestamp: r.t.toISOString(), price: r.price })),
+        chart_data: rows.map((r) => ({ timestamp: new Date(r.t).toISOString(), price: r.price })),
       },
       {
         status: 200,
